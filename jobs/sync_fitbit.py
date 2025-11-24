@@ -27,6 +27,24 @@ import requests
 LAMP_BASE: Optional[str] = os.getenv("LAMP_BASE")  # e.g. https://api.mind.momonia.net or with /api
 LAMP_AUTH: Optional[str] = os.getenv("LAMP_AUTH")  # e.g. "Basic XXX" or "Bearer YYY"
 
+
+# ---- Helpers pour envoyer 1 événement par mesure (avec batching) ----
+
+def chunked(iterable, size):
+    """Coupe une liste en paquets de taille 'size'."""
+    for i in range(0, len(iterable), size):
+        yield iterable[i:i + size]
+
+def send_points_in_batches(user_id: str, sensor_name: str, points: list, batch_size: int = 200):
+    """
+    Envoie les mesures vers mindLAMP par paquets.
+    Chaque élément de 'points' est une mesure du capteur.
+    """
+    for batch in chunked(points, batch_size):
+        # Ici 'batch' est une liste de mesures.
+        # Si send_to_lamp attend déjà une liste d'événements, c'est parfait.
+        send_to_lamp(user_id, sensor_name, batch)
+
 def token_expired(row: FitbitConnection) -> bool:
     """Return True if the access token is expired."""
     return datetime.utcnow() >= row.expires_at.replace(tzinfo=None)
@@ -131,10 +149,15 @@ def run_once() -> None:
             row.last_synced_at = datetime.utcnow()
             db.commit()
 
-            # Send only non-empty datasets
-            send_to_lamp(row.user_id, "steps", steps)
-            send_to_lamp(row.user_id, "sleep", sleep)
-            send_to_lamp(row.user_id, "heartrate", hr)
+            # Envoyer 1 événement par mesure (par paquets)
+            if steps:
+                send_points_in_batches(row.user_id, "steps", steps)
+
+            if sleep:
+                send_points_in_batches(row.user_id, "sleep", sleep)
+
+            if hr:
+                send_points_in_batches(row.user_id, "heartrate", hr)
 
     finally:
         db.close()
