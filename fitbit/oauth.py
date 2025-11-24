@@ -59,11 +59,27 @@ def refresh_tokens(refresh_token: str):
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
     }
-    r = requests.post(TOKEN_URL,
-                      headers={**_basic_auth_header(),
-                               "Content-Type": "application/x-www-form-urlencoded"},
-                      data=data, timeout=30)
-    r.raise_for_status()
+    try:
+        r = requests.post(
+            TOKEN_URL,
+            headers={**_basic_auth_header(),
+                     "Content-Type": "application/x-www-form-urlencoded"},
+            data=data,
+            timeout=30,
+        )
+        # Si Fitbit répond 4xx/5xx, ça lève une exception HTTPError
+        r.raise_for_status()
+    except requests.HTTPError as e:
+        print("[FITBIT] Token refresh HTTPError")
+        try:
+            print("Response status:", e.response.status_code)
+            print("Response body:", e.response.text)
+        except Exception:
+            pass
+        # On relance l'erreur pour que le caller garde le comportement actuel
+        raise
+
     payload = r.json()
     payload["expires_at"] = (datetime.utcnow() + timedelta(seconds=payload["expires_in"])).isoformat()
     return payload
+

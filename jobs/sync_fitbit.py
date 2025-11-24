@@ -3,7 +3,7 @@
 import os
 import sys
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 # Make sure imports work whether you run from project root or jobs/
@@ -54,7 +54,7 @@ def send_points_in_batches(user_id: str, sensor_name: str, points: list, batch_s
 
 def token_expired(row: FitbitConnection) -> bool:
     """Return True if the access token is expired."""
-    return datetime.utcnow() >= row.expires_at.replace(tzinfo=None)
+    return datetime.now(timezone.utc) >= row.expires_at.replace(tzinfo=None)
 
 
 def _trim_fitbit(sensor: str, data: dict):
@@ -95,7 +95,7 @@ def send_to_lamp(user_id: str, sensor: str, payload_data) -> None:
         pass
 
     payload = {
-        "timestamp": int(datetime.utcnow().timestamp() * 1000),
+        "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
         "sensor": f"fitbit_{sensor}",
         "data": payload_data,
     }
@@ -123,7 +123,7 @@ def run_once() -> None:
             return
 
         # Date "fin" commune à tous : aujourd'hui (en UTC)
-        today = datetime.utcnow().date()
+        today = datetime.now(timezone.utc).date()
         end_ymd = today.isoformat()
 
         for row in rows:
@@ -185,7 +185,7 @@ def run_once() -> None:
                 send_points_in_batches(row.user_id, "heartrate", hr)
 
             # 7) Mettre à jour last_synced_at une fois les envois terminés
-            row.last_synced_at = datetime.utcnow()
+            row.last_synced_at = datetime.now(timezone.utc)
             db.commit()
 
     finally:
