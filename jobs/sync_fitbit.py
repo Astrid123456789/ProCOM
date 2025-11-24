@@ -32,23 +32,16 @@ import requests
 LAMP_BASE: Optional[str] = os.getenv("LAMP_BASE")  # e.g. https://api.mind.momonia.net or with /api
 LAMP_AUTH: Optional[str] = os.getenv("LAMP_AUTH")  # e.g. "Basic XXX" or "Bearer YYY"
 
-# You can change these if you want minute-level instead of hourly
-STEPS_FREQ = os.getenv("FITBIT_STEPS_FREQ", "1h")        # "1h" or "1min"
-HR_FREQ = os.getenv("FITBIT_HR_FREQ", "1h")              # "1h" or "1min"
-SLEEP_FREQ = "daily"  # kept for clarity; get_sleep ignores it but signature requires it
+# ---- Frequency configuration ----
+# You can change these in your .env if you want minute-level instead of hourly:
+# FITBIT_STEPS_FREQ=1min
+# FITBIT_HR_FREQ=1min
+STEPS_FREQ = os.getenv("FITBIT_STEPS_FREQ", "1h")  # "1h" or "1min"
+HR_FREQ = os.getenv("FITBIT_HR_FREQ", "1h")        # "1h" or "1min"
+SLEEP_FREQ = "daily"  # kept for clarity; get_sleep ignores it but expects a freq param
 
 
-# ---- Helpers pour envoyer 1 événement par mesure ----
-
-def send_points_in_batches(user_id: str, sensor_name: str, points: list, batch_size: int = 200):
-    """
-    Envoie les mesures vers mindLAMP.
-    Ici, 1 point = 1 événement → chaque mesure devient un sensor_event séparé.
-    Le paramètre batch_size est gardé pour compatibilité mais non utilisé.
-    """
-    for point in points:
-        send_to_lamp(user_id, sensor_name, point)
-
+# ---- Helpers ----
 
 def token_expired(row: FitbitConnection) -> bool:
     """Return True if the access token is expired."""
@@ -103,6 +96,16 @@ def send_to_lamp(user_id: str, sensor: str, payload_data) -> None:
     except Exception as e:
         print(f"[WARN] Failed to POST {sensor} to LAMP for {user_id}: {e}")
 
+
+def send_points_one_by_one(user_id: str, sensor_name: str, points: list) -> None:
+    """
+    1 point = 1 événement → chaque mesure devient un sensor_event séparé.
+    """
+    for point in points:
+        send_to_lamp(user_id, sensor_name, point)
+
+
+# ---- Main job ----
 
 def run_once() -> None:
     db = SessionLocal()
@@ -175,8 +178,9 @@ def run_once() -> None:
                 except Exception as e:
                     print(f"[WARN] Failed to parse sleep entry {s}: {e}")
 
-            steps_points = steps_raw  # already [{"timestamp":..., "steps":...}, ...]
-            hr_points = hr_raw        # already [{"timestamp":..., "heartrate":...}, ...]
+            # steps_raw and hr_raw are already lists of points with timestamp
+            steps_points = steps_raw          # [{"timestamp":..., "steps":...}, ...]
+            hr_points = hr_raw                # [{"timestamp":..., "heartrate":...}, ...]
 
             # 5) Petit résumé console
             display_name = profile.get("user", {}).get("displayName", "<unknown>")
@@ -188,11 +192,11 @@ def run_once() -> None:
 
             # 6) Envoyer 1 événement par mesure
             if steps_points:
-                send_points_in_batches(row.user_id, "steps", steps_points)
+                send_points_one_by_one(row.user_id, "steps", steps_points)
             if sleep_points:
-                send_points_in_batches(row.user_id, "sleep", sleep_points)
+                send_points_one_by_one(row.user_id, "sleep", sleep_points)
             if hr_points:
-                send_points_in_batches(row.user_id, "heartrate", hr_points)
+                send_points_one_by_one(row.user_id, "heartrate", hr_points)
 
             # 7) Mettre à jour last_synced_at une fois les envois terminés
             row.last_synced_at = datetime.now(timezone.utc)
