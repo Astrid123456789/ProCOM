@@ -27,6 +27,20 @@ import requests
 LAMP_BASE: Optional[str] = os.getenv("LAMP_BASE")  # e.g. https://api.mind.momonia.net or with /api
 LAMP_AUTH: Optional[str] = os.getenv("LAMP_AUTH")  # e.g. "Basic XXX" or "Bearer YYY"
 
+from datetime import datetime, timedelta
+
+today = datetime.utcnow().date()
+
+if row.last_synced_at is None:
+    # Premier sync : on prend par exemple les 7 derniers jours
+    start_date = today - timedelta(days=7)
+else:
+    # Sync incrémental : on reprend à partir du dernier sync
+    # On peut éventuellement reculer d'1 jour pour être safe
+    start_date = row.last_synced_at.date()  # ou row.last_synced_at.date() - timedelta(days=1)
+
+start_ymd = start_date.strftime("%Y-%m-%d")
+end_ymd = today.strftime("%Y-%m-%d")
 
 # ---- Helpers pour envoyer 1 événement par mesure (avec batching) ----
 
@@ -108,8 +122,12 @@ def run_once() -> None:
             print("No Fitbit connections found. Run the auth flow first.")
             return
 
+        # Date "fin" commune à tous : aujourd'hui (en UTC)
+        today = datetime.utcnow().date()
+        end_ymd = today.isoformat()
+
         for row in rows:
-            # Refresh token if needed
+            # 1) Rafraîchir le token si besoin
             if token_expired(row):
                 try:
                     new = refresh_tokens(row.refresh_token)
@@ -122,42 +140,54 @@ def run_once() -> None:
                     print(f"[ERROR] Token refresh failed for {row.user_id}: {e}")
                     continue
 
-            access = row.access_token
+            access_token = row.access_token
 
-            # Fetch data
+            # 2) Déterminer la date de début en fonction de last_synced_at
+            if row.last_synced_at is None:
+                # Premier sync : on prend par exemple les 7 derniers jours
+                start_date = today - timedelta(days=7)
+            else:
+                # Sync incrémental : on reprend à partir de la dernière sync
+                # (tu peux reculer d'1 jour si tu veux être ultra safe)
+                start_date = row.last_synced_at.date()
+
+            start_ymd = start_date.isoformat()
+
+            # 3) Récupérer les données Fitbit sur [start_ymd, end_ymd]
             try:
-                profile = get_profile(access)
-                steps = get_steps_7d(access)
-                # Sleep: query yesterday (today is often empty)
-                yday = (datetime.utcnow() - timedelta(days=1)).date().isoformat()
-                sleep = get_sleep_for_date(access, yday)
-                hr = get_hr_7d(access)
+                profile = get_profile(access_token)
+                steps_raw = get_steps_range(access_token, start_ymd, end_ymd)
+                sleep_raw = get_sleep_range(access_token, start_ymd, end_ymd)
+                hr_raw    = get_hr_range(access_token, start_ymd, end_ymd)
             except Exception as e:
                 print(f"[ERROR] Fitbit API error for {row.user_id}: {e}")
                 continue
 
-            # Print quick summary + counts so you SEE if it's empty or not
+            # 4) Transformer les bruts Fitbit en listes de points "plats"
+            #    (en supposant que _trim_fitbit(type, raw) renvoie une liste de mesures)
+            steps = _trim_fitbit("steps", steps_raw)
+            sleep = _trim_fitbit("sleep", sleep_raw)
+            hr    = _trim_fitbit("heartrate", hr_raw)
+
+            # 5) Petit résumé console
             display_name = profile.get("user", {}).get("displayName", "<unknown>")
-            steps_arr = _trim_fitbit("steps", steps)
-            sleep_arr = _trim_fitbit("sleep", sleep)
-            hr_arr    = _trim_fitbit("heartrate", hr)
-
             print(f"[{row.user_id}] profile: {display_name}")
-            print(f"[{row.user_id}] counts → steps:{len(steps_arr)} sleep:{len(sleep_arr)} hr:{len(hr_arr)}")
+            print(
+                f"[{row.user_id}] counts → steps:{len(steps)} "
+                f"sleep:{len(sleep)} hr:{len(hr)}"
+            )
 
-            # Update last sync
-            row.last_synced_at = datetime.utcnow()
-            db.commit()
-
-            # Envoyer 1 événement par mesure (par paquets)
+            # 6) Envoyer 1 événement par mesure (par paquets)
             if steps:
                 send_points_in_batches(row.user_id, "steps", steps)
-
             if sleep:
                 send_points_in_batches(row.user_id, "sleep", sleep)
-
             if hr:
                 send_points_in_batches(row.user_id, "heartrate", hr)
+
+            # 7) Mettre à jour last_synced_at une fois les envois terminés
+            row.last_synced_at = datetime.utcnow()
+            db.commit()
 
     finally:
         db.close()
