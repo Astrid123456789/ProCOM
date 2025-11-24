@@ -6,7 +6,7 @@ import json
 from datetime import datetime, timedelta
 from typing import Optional
 
-# Make sure imports work whether you run from project root or jobs/ 
+# Make sure imports work whether you run from project root or jobs/
 CURRENT_DIR = os.path.dirname(__file__)
 PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
 if PROJECT_ROOT not in sys.path:
@@ -16,31 +16,23 @@ if PROJECT_ROOT not in sys.path:
 from dotenv import load_dotenv
 load_dotenv()  # loads .env from project root
 
-# Local modules 
+# Local modules
 from db import SessionLocal, FitbitConnection
 from fitbit.oauth import refresh_tokens
-from fitbit.sync import get_profile, get_steps_7d, get_sleep_for_date, get_hr_7d
+# 👉 Assure-toi d'avoir bien créé ces fonctions dans fitbit/sync.py
+from fitbit.sync import (
+    get_profile,
+    get_steps_range,
+    get_sleep_range,
+    get_hr_range,
+)
 
-# Optional: posting to mindLAMP 
+# Optional: posting to mindLAMP
 import requests
 
 LAMP_BASE: Optional[str] = os.getenv("LAMP_BASE")  # e.g. https://api.mind.momonia.net or with /api
 LAMP_AUTH: Optional[str] = os.getenv("LAMP_AUTH")  # e.g. "Basic XXX" or "Bearer YYY"
 
-from datetime import datetime, timedelta
-
-today = datetime.utcnow().date()
-
-if row.last_synced_at is None:
-    # Premier sync : on prend par exemple les 7 derniers jours
-    start_date = today - timedelta(days=7)
-else:
-    # Sync incrémental : on reprend à partir du dernier sync
-    # On peut éventuellement reculer d'1 jour pour être safe
-    start_date = row.last_synced_at.date()  # ou row.last_synced_at.date() - timedelta(days=1)
-
-start_ymd = start_date.strftime("%Y-%m-%d")
-end_ymd = today.strftime("%Y-%m-%d")
 
 # ---- Helpers pour envoyer 1 événement par mesure (avec batching) ----
 
@@ -49,22 +41,27 @@ def chunked(iterable, size):
     for i in range(0, len(iterable), size):
         yield iterable[i:i + size]
 
+
 def send_points_in_batches(user_id: str, sensor_name: str, points: list, batch_size: int = 200):
     """
     Envoie les mesures vers mindLAMP par paquets.
-    Chaque élément de 'points' est une mesure du capteur.
+    Chaque élément de 'points' est une mesure ou un petit dict déjà 'trimmed'.
     """
     for batch in chunked(points, batch_size):
-        # Ici 'batch' est une liste de mesures.
-        # Si send_to_lamp attend déjà une liste d'événements, c'est parfait.
+        # Ici 'batch' est une liste de mesures prêtes à être envoyées
         send_to_lamp(user_id, sensor_name, batch)
+
 
 def token_expired(row: FitbitConnection) -> bool:
     """Return True if the access token is expired."""
     return datetime.utcnow() >= row.expires_at.replace(tzinfo=None)
 
+
 def _trim_fitbit(sensor: str, data: dict):
-    """Return just the meaningful array for each Fitbit dataset."""
+    """
+    Retourne uniquement le tableau utile pour chaque dataset Fitbit.
+    On assume que 'data' est le JSON brut renvoyé par l'API Fitbit.
+    """
     if sensor == "steps":
         return data.get("activities-steps", [])
     if sensor == "sleep":
@@ -73,24 +70,26 @@ def _trim_fitbit(sensor: str, data: dict):
         return data.get("activities-heart", [])
     return data
 
-def send_to_lamp(user_id: str, sensor: str, data: dict) -> None:
+
+def send_to_lamp(user_id: str, sensor: str, payload_data) -> None:
     """
-    Send only the relevant Fitbit arrays to mindLAMP, if LAMP_BASE and LAMP_AUTH are configured.
-    Skip sending when there's nothing to send.
+    Envoie à mindLAMP un payload déjà 'prêt' (payload_data = liste de mesures
+    ou dict). On ne re-trim plus ici, on suppose que c'est déjà sélectionné.
     """
     if not (LAMP_BASE and LAMP_AUTH):
         print("[WARN] LAMP_BASE or LAMP_AUTH not set. Skipping send.")
         return
 
-    payload_data = _trim_fitbit(sensor, data)
-
     if not payload_data:
-        print(f"[{user_id}] skip {sensor}: Fitbit returned no data to send.")
+        print(f"[{user_id}] skip {sensor}: nothing to send.")
         return
 
     # Optional: show a tiny sample so you can see what is being sent
     try:
-        sample = payload_data[:1] if isinstance(payload_data, list) else payload_data
+        if isinstance(payload_data, list):
+            sample = payload_data[:1]
+        else:
+            sample = payload_data
         print(f"[{user_id}] {sensor} sample → {json.dumps(sample, ensure_ascii=False)[:400]}")
     except Exception:
         pass
@@ -113,6 +112,7 @@ def send_to_lamp(user_id: str, sensor: str, data: dict) -> None:
         print(f"LAMP POST {sensor} for {user_id} → {r.status_code} {r.text[:200]}")
     except Exception as e:
         print(f"[WARN] Failed to POST {sensor} to LAMP for {user_id}: {e}")
+
 
 def run_once() -> None:
     db = SessionLocal()
@@ -164,7 +164,6 @@ def run_once() -> None:
                 continue
 
             # 4) Transformer les bruts Fitbit en listes de points "plats"
-            #    (en supposant que _trim_fitbit(type, raw) renvoie une liste de mesures)
             steps = _trim_fitbit("steps", steps_raw)
             sleep = _trim_fitbit("sleep", sleep_raw)
             hr    = _trim_fitbit("heartrate", hr_raw)
@@ -192,5 +191,7 @@ def run_once() -> None:
     finally:
         db.close()
 
+
 if __name__ == "__main__":
     run_once()
+
