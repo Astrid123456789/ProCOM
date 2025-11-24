@@ -54,7 +54,17 @@ def send_points_in_batches(user_id: str, sensor_name: str, points: list, batch_s
 
 def token_expired(row: FitbitConnection) -> bool:
     """Return True if the access token is expired."""
-    return datetime.now(timezone.utc) >= row.expires_at.replace(tzinfo=None)
+    expires_at = row.expires_at
+    if expires_at is None:
+        # Si on n'a pas d'info, on considère le token comme expiré
+        return True
+
+    # Si la valeur en DB est naive → on la convertit en aware UTC
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+
+    now = datetime.now(timezone.utc)
+    return now >= expires_at
 
 
 def _trim_fitbit(sensor: str, data: dict):
@@ -133,6 +143,7 @@ def run_once() -> None:
                     new = refresh_tokens(row.refresh_token)
                     row.access_token = new["access_token"]
                     row.refresh_token = new["refresh_token"]
+                    # new["expires_at"] est isoformat() sans tz → naive
                     row.expires_at = datetime.fromisoformat(new["expires_at"])
                     db.commit()
                     print(f"[{row.user_id}] token refreshed")
@@ -149,6 +160,7 @@ def run_once() -> None:
             else:
                 # Sync incrémental : on reprend à partir de la dernière sync
                 # (tu peux reculer d'1 jour si tu veux être ultra safe)
+                # last_synced_at peut être naive ou aware, on ne garde que la date
                 start_date = row.last_synced_at.date()
 
             start_ymd = start_date.isoformat()
@@ -194,4 +206,3 @@ def run_once() -> None:
 
 if __name__ == "__main__":
     run_once()
-
