@@ -1,65 +1,156 @@
 import requests
+from datetime import datetime, timedelta
+from typing import List, Dict, Any
 
 API = "https://api.fitbit.com"
 
-def _auth_headers(access_token: str):
+# -------------------------------------------------------------------
+# Auth header
+# -------------------------------------------------------------------
+
+def _auth(access_token: str):
     return {"Authorization": f"Bearer {access_token}"}
 
-def get_profile(access_token: str) -> dict:
-    r = requests.get(f"{API}/1/user/-/profile.json",
-                     headers=_auth_headers(access_token), timeout=30)
-    r.raise_for_status()
-    return r.json()
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
 
-def get_steps_7d(access_token: str) -> dict:
-    r = requests.get(f"{API}/1/user/-/activities/steps/date/today/7d.json",
-                     headers=_auth_headers(access_token), timeout=30)
-    r.raise_for_status()
-    return r.json()
+def _combine_datetime(ymd: str, time_str: str) -> datetime:
+    d = datetime.strptime(ymd, "%Y-%m-%d").date()
+    t = datetime.strptime(time_str, "%H:%M:%S").time()
+    return datetime.combine(d, t)
 
-def get_sleep_for_date(access_token: str, ymd: str) -> dict:
-    r = requests.get(f"{API}/1.2/user/-/sleep/date/{ymd}.json",
-                     headers=_auth_headers(access_token), timeout=30)
-    r.raise_for_status()
-    return r.json()
+def _floor_to_hour(dt: datetime) -> datetime:
+    return dt.replace(minute=0, second=0, microsecond=0)
 
-def get_hr_7d(access_token: str) -> dict:
-    r = requests.get(f"{API}/1/user/-/activities/heart/date/today/7d.json",
-                     headers=_auth_headers(access_token), timeout=30)
-    r.raise_for_status()
-    return r.json()
+# -------------------------------------------------------------------
+# SLEEP  (daily only — Fitbit does not support intraday sleep stages
+#         except minute-level sleep stages which do NOT represent duration)
+# -------------------------------------------------------------------
 
-
-def get_steps_range(access_token: str, start_ymd: str, end_ymd: str) -> dict:
+def get_sleep(access_token: str, start_ymd: str, end_ymd: str, freq: str):
     """
-    Récupère les steps jour par jour entre start_ymd et end_ymd (YYYY-MM-DD).
-    """
-    r = requests.get(
-        f"{API}/1/user/-/activities/steps/date/{start_ymd}/{end_ymd}.json",
-        headers=_auth_headers(access_token),
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.json()
+    freq is ignored for sleep because Fitbit only supports daily sleep duration.
 
-
-def get_hr_range(access_token: str, start_ymd: str, end_ymd: str) -> dict:
+    Returns:
+        [
+          {"date": "2025-11-10", "duration_minutes": 421.0},
+          ...
+        ]
     """
-    Récupère le heart rate journalié entre start_ymd et end_ymd.
-    """
-    r = requests.get(
-        f"{API}/1/user/-/activities/heart/date/{start_ymd}/{end_ymd}.json",
-        headers=_auth_headers(access_token),
-        timeout=30,
-    )
+    url = f"{API}/1.2/user/-/sleep/date/{start_ymd}/{end_ymd}.json"
+    r = requests.get(url, headers=_auth(access_token), timeout=30)
     r.raise_for_status()
-    return r.json()
+    raw = r.json()
 
-def get_sleep_range(access_token: str, start_ymd: str, end_ymd: str) -> dict:
-    r = requests.get(
-        f"{API}/1.2/user/-/sleep/date/{start_ymd}/{end_ymd}.json",
-        headers=_auth_headers(access_token),
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.json()
+    by_day = {}
+
+    for entry in raw.get("sleep", []):
+        d = entry.get("dateOfSleep")
+        dur = entry.get("duration", 0)  # ms
+        if d:
+            by_day[d] = by_day.get(d, 0) + dur
+
+    results = []
+    for d, ms in sorted(by_day.items()):
+        results.append({
+            "date": d,
+            "duration_minutes": ms / 1000 / 60
+        })
+
+    return results
+
+# -------------------------------------------------------------------
+# STEPS (intraday 1-minute → aggregated depending on freq)
+# -------------------------------------------------------------------
+
+def get_steps(access_token: str, start_ymd: str, end_ymd: str, freq: str):
+    """
+    freq: "1min" or "1h"
+    Returns:
+        - 1min → [{"timestamp": ..., "steps": value}, ...]
+        - 1h   → [{"timestamp": ..., "steps": sum_per_hour}, ...]
+    """
+    all_points = []
+    current = datetime.strptime(start_ymd, "%Y-%m-%d").date()
+    end = datetime.strptime(end_ymd, "%Y-%m-%d").date()
+
+    while current <= end:
+        day = current.isoformat()
+        url = f"{API}/1/user/-/activities/steps/date/{day}/1d/1min.json"
+        r = requests.get(url, headers=_auth(access_token), timeout=30)
+        r.raise_for_status()
+        raw = r.json()
+
+        dataset = raw.get("activities-steps-intraday", {}).get("dataset", [])
+
+        if freq == "1min":
+            for entry in dataset:
+                dt = _combine_datetime(day, entry["time"])
+                ts = int(dt.timestamp() * 1000)
+                all_points.append({"timestamp": ts, "steps": entry["value"]})
+
+        elif freq == "1h":
+            hourly = {}
+            for entry in dataset:
+                dt = _combine_datetime(day, entry["time"])
+                h = _floor_to_hour(dt)
+                hourly[h] = hourly.get(h, 0) + entry["value"]
+
+            for hdt, total in sorted(hourly.items()):
+                ts = int(hdt.timestamp() * 1000)
+                all_points.append({"timestamp": ts, "steps": total})
+
+        current += timedelta(days=1)
+
+    return all_points
+
+# -------------------------------------------------------------------
+# HEART RATE (intraday 1-minute → aggregated depending on freq)
+# -------------------------------------------------------------------
+
+def get_heartrate(access_token: str, start_ymd: str, end_ymd: str, freq: str):
+    """
+    freq: "1min" or "1h"
+    Returns:
+        - 1min → [{"timestamp": ..., "heartrate": bpm}, ...]
+        - 1h   → [{"timestamp": ..., "heartrate": avg_bpm_for_hour}, ...]
+    """
+    all_points = []
+    current = datetime.strptime(start_ymd, "%Y-%m-%d").date()
+    end = datetime.strptime(end_ymd, "%Y-%m-%d").date()
+
+    while current <= end:
+        day = current.isoformat()
+        url = f"{API}/1/user/-/activities/heart/date/{day}/1d/1min.json"
+        r = requests.get(url, headers=_auth(access_token), timeout=30)
+        r.raise_for_status()
+        raw = r.json()
+
+        dataset = raw.get("activities-heart-intraday", {}).get("dataset", [])
+
+        if freq == "1min":
+            for entry in dataset:
+                dt = _combine_datetime(day, entry["time"])
+                ts = int(dt.timestamp() * 1000)
+                all_points.append({"timestamp": ts, "heartrate": entry["value"]})
+
+        elif freq == "1h":
+            sums = {}
+            counts = {}
+
+            for entry in dataset:
+                dt = _combine_datetime(day, entry["time"])
+                h = _floor_to_hour(dt)
+                sums[h] = sums.get(h, 0) + entry["value"]
+                counts[h] = counts.get(h, 0) + 1
+
+            for hdt in sorted(sums.keys()):
+                avg = sums[hdt] / counts[hdt]
+                ts = int(hdt.timestamp() * 1000)
+                all_points.append({"timestamp": ts, "heartrate": avg})
+
+        current += timedelta(days=1)
+
+    return all_points
+

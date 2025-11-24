@@ -19,12 +19,11 @@ load_dotenv()  # loads .env from project root
 # Local modules
 from db import SessionLocal, FitbitConnection
 from fitbit.oauth import refresh_tokens
-# 👉 Assure-toi d'avoir bien créé ces fonctions dans fitbit/sync.py
 from fitbit.sync import (
     get_profile,
-    get_steps_range,
-    get_sleep_range,
-    get_hr_range,
+    get_sleep,
+    get_steps,
+    get_heartrate,
 )
 
 # Optional: posting to mindLAMP
@@ -33,23 +32,22 @@ import requests
 LAMP_BASE: Optional[str] = os.getenv("LAMP_BASE")  # e.g. https://api.mind.momonia.net or with /api
 LAMP_AUTH: Optional[str] = os.getenv("LAMP_AUTH")  # e.g. "Basic XXX" or "Bearer YYY"
 
+# You can change these if you want minute-level instead of hourly
+STEPS_FREQ = os.getenv("FITBIT_STEPS_FREQ", "1h")        # "1h" or "1min"
+HR_FREQ = os.getenv("FITBIT_HR_FREQ", "1h")              # "1h" or "1min"
+SLEEP_FREQ = "daily"  # kept for clarity; get_sleep ignores it but signature requires it
 
-# ---- Helpers pour envoyer 1 événement par mesure (avec batching) ----
 
-def chunked(iterable, size):
-    """Coupe une liste en paquets de taille 'size'."""
-    for i in range(0, len(iterable), size):
-        yield iterable[i:i + size]
-
+# ---- Helpers pour envoyer 1 événement par mesure ----
 
 def send_points_in_batches(user_id: str, sensor_name: str, points: list, batch_size: int = 200):
     """
-    Envoie les mesures vers mindLAMP par paquets.
-    Chaque élément de 'points' est une mesure ou un petit dict déjà 'trimmed'.
+    Envoie les mesures vers mindLAMP.
+    Ici, 1 point = 1 événement → chaque mesure devient un sensor_event séparé.
+    Le paramètre batch_size est gardé pour compatibilité mais non utilisé.
     """
-    for batch in chunked(points, batch_size):
-        # Ici 'batch' est une liste de mesures prêtes à être envoyées
-        send_to_lamp(user_id, sensor_name, batch)
+    for point in points:
+        send_to_lamp(user_id, sensor_name, point)
 
 
 def token_expired(row: FitbitConnection) -> bool:
@@ -67,24 +65,10 @@ def token_expired(row: FitbitConnection) -> bool:
     return now >= expires_at
 
 
-def _trim_fitbit(sensor: str, data: dict):
-    """
-    Retourne uniquement le tableau utile pour chaque dataset Fitbit.
-    On assume que 'data' est le JSON brut renvoyé par l'API Fitbit.
-    """
-    if sensor == "steps":
-        return data.get("activities-steps", [])
-    if sensor == "sleep":
-        return data.get("sleep", [])
-    if sensor == "heartrate":
-        return data.get("activities-heart", [])
-    return data
-
-
 def send_to_lamp(user_id: str, sensor: str, payload_data) -> None:
     """
-    Envoie à mindLAMP un payload déjà 'prêt' (payload_data = liste de mesures
-    ou dict). On ne re-trim plus ici, on suppose que c'est déjà sélectionné.
+    Envoie à mindLAMP un payload déjà 'prêt' (payload_data = UNE mesure).
+    1 appel = 1 sensor_event = 1 mesure (dans data).
     """
     if not (LAMP_BASE and LAMP_AUTH):
         print("[WARN] LAMP_BASE or LAMP_AUTH not set. Skipping send.")
@@ -96,11 +80,7 @@ def send_to_lamp(user_id: str, sensor: str, payload_data) -> None:
 
     # Optional: show a tiny sample so you can see what is being sent
     try:
-        if isinstance(payload_data, list):
-            sample = payload_data[:1]
-        else:
-            sample = payload_data
-        print(f"[{user_id}] {sensor} sample → {json.dumps(sample, ensure_ascii=False)[:400]}")
+        print(f"[{user_id}] {sensor} sample → {json.dumps(payload_data, ensure_ascii=False)[:400]}")
     except Exception:
         pass
 
@@ -155,12 +135,11 @@ def run_once() -> None:
 
             # 2) Déterminer la date de début en fonction de last_synced_at
             if row.last_synced_at is None:
-                # Premier sync : on prend par exemple les 7 derniers jours
+                # Premier sync : on prend les 7 derniers jours
                 start_date = today - timedelta(days=7)
             else:
                 # Sync incrémental : on reprend à partir de la dernière sync
                 # (tu peux reculer d'1 jour si tu veux être ultra safe)
-                # last_synced_at peut être naive ou aware, on ne garde que la date
                 start_date = row.last_synced_at.date()
 
             start_ymd = start_date.isoformat()
@@ -168,33 +147,52 @@ def run_once() -> None:
             # 3) Récupérer les données Fitbit sur [start_ymd, end_ymd]
             try:
                 profile = get_profile(access_token)
-                steps_raw = get_steps_range(access_token, start_ymd, end_ymd)
-                sleep_raw = get_sleep_range(access_token, start_ymd, end_ymd)
-                hr_raw    = get_hr_range(access_token, start_ymd, end_ymd)
+
+                # Sleep: daily durations
+                sleep_raw = get_sleep(access_token, start_ymd, end_ymd, SLEEP_FREQ)
+
+                # Steps: hourly or per-minute totals
+                steps_raw = get_steps(access_token, start_ymd, end_ymd, STEPS_FREQ)
+
+                # HR: hourly or per-minute averages
+                hr_raw = get_heartrate(access_token, start_ymd, end_ymd, HR_FREQ)
             except Exception as e:
                 print(f"[ERROR] Fitbit API error for {row.user_id}: {e}")
                 continue
 
-            # 4) Transformer les bruts Fitbit en listes de points "plats"
-            steps = _trim_fitbit("steps", steps_raw)
-            sleep = _trim_fitbit("sleep", sleep_raw)
-            hr    = _trim_fitbit("heartrate", hr_raw)
+            # 4) Transformer le sleep (date → timestamp) pour avoir "une mesure"
+            sleep_points = []
+            for s in sleep_raw:
+                # s = {"date": "YYYY-MM-DD", "duration_minutes": float}
+                try:
+                    d = datetime.strptime(s["date"], "%Y-%m-%d").date()
+                    dt = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+                    ts = int(dt.timestamp() * 1000)
+                    sleep_points.append({
+                        "timestamp": ts,
+                        "duration_minutes": s["duration_minutes"],
+                    })
+                except Exception as e:
+                    print(f"[WARN] Failed to parse sleep entry {s}: {e}")
+
+            steps_points = steps_raw  # already [{"timestamp":..., "steps":...}, ...]
+            hr_points = hr_raw        # already [{"timestamp":..., "heartrate":...}, ...]
 
             # 5) Petit résumé console
             display_name = profile.get("user", {}).get("displayName", "<unknown>")
             print(f"[{row.user_id}] profile: {display_name}")
             print(
-                f"[{row.user_id}] counts → steps:{len(steps)} "
-                f"sleep:{len(sleep)} hr:{len(hr)}"
+                f"[{row.user_id}] counts → steps:{len(steps_points)} "
+                f"sleep:{len(sleep_points)} hr:{len(hr_points)}"
             )
 
-            # 6) Envoyer 1 événement par mesure (par paquets)
-            if steps:
-                send_points_in_batches(row.user_id, "steps", steps)
-            if sleep:
-                send_points_in_batches(row.user_id, "sleep", sleep)
-            if hr:
-                send_points_in_batches(row.user_id, "heartrate", hr)
+            # 6) Envoyer 1 événement par mesure
+            if steps_points:
+                send_points_in_batches(row.user_id, "steps", steps_points)
+            if sleep_points:
+                send_points_in_batches(row.user_id, "sleep", sleep_points)
+            if hr_points:
+                send_points_in_batches(row.user_id, "heartrate", hr_points)
 
             # 7) Mettre à jour last_synced_at une fois les envois terminés
             row.last_synced_at = datetime.now(timezone.utc)
@@ -206,3 +204,4 @@ def run_once() -> None:
 
 if __name__ == "__main__":
     run_once()
+
